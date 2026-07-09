@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+
+# big/noisy - keep the live snapshot files below out of backups
+data/backup_*/
+
+# trade data kept out of the public repo entirely
+data/positions.json
+data/opportunities.jsonl
+data/matches.json
+data/gap_monitor.jsonl
+data/gap_refs.json
+data/asset_volatility.json
+data/gui_log.txt
+data/bot.lock
+config.json
+data_watch_log.txt
