@@ -43,18 +43,25 @@ def print_locked(positions):
 
 
 def build_matches(cfg):
+    t0 = time.perf_counter()
     print(f"[{_now()}] fetching markets (expiry <= {cfg['max_expiry_minutes']} min)...")
     kalshi = fetchers.fetch_kalshi(cfg["max_expiry_minutes"])
+    t1 = time.perf_counter()
     poly = fetchers.fetch_polymarket(cfg["max_expiry_minutes"])
-    print(f"[{_now()}] kalshi tradeable: {len(kalshi)} | polymarket tradeable: {len(poly)}")
+    t2 = time.perf_counter()
+    print(f"[{_now()}] kalshi tradeable: {len(kalshi)} ({(t1 - t0) * 1000:.0f}ms) "
+          f"| polymarket tradeable: {len(poly)} ({(t2 - t1) * 1000:.0f}ms)")
     matches = matcher.match_markets(kalshi, poly, cfg)
+    t3 = time.perf_counter()
     paper.save_matches(matches)   # so the GUIs can display current pairs
     paper.capture_gap_references(matches)  # gap monitor: snapshot spot price on first sighting
-    print(f"[{_now()}] candidate pairs (score >= {cfg['match_score_log']}): {len(matches)}")
+    print(f"[{_now()}] candidate pairs (score >= {cfg['match_score_log']}): {len(matches)} "
+          f"| match {(t3 - t2) * 1000:.0f}ms | total {(t3 - t0) * 1000:.0f}ms")
     return matches
 
 
 def scan_cycle(matches, cfg, positions, trade: bool):
+    t0 = time.perf_counter()
     tradeable = [m for m in matches if m["score"] >= cfg["match_score_trade"]
                  and m["align_conf"] >= 0.5][:cfg["max_pairs_per_cycle"]]
     checked = 0
@@ -98,6 +105,7 @@ def scan_cycle(matches, cfg, positions, trade: bool):
                     print(f"[{_now()}] PAPER TRADE: {leg_breakdown(pos)} "
                           f"| total ${pos['cost_usd'] + pos['fee_usd']:.2f}, payout $"
                           f"{pos['contracts']:.2f}, locked +${pos['expected_profit_usd']}")
+    scan_cycle.last_ms = (time.perf_counter() - t0) * 1000
     return checked
 
 
@@ -153,7 +161,9 @@ def cmd_watch(cfg):
                 refresh_thread = threading.Thread(target=_refresh_into,
                                                   args=(cfg, refresh_box), daemon=True)
                 refresh_thread.start()
-            scan_cycle(matches, cfg, positions, trade=True)
+            checked = scan_cycle(matches, cfg, positions, trade=True)
+            print(f"[{_now()}] book scan {scan_cycle.last_ms:.0f}ms "
+                  f"({checked} pairs checked)")
             for pos in paper.check_position_gaps(positions, cfg):
                 print(f"[{_now()}] GAP MONITOR EXIT pnl ${pos['pnl_usd']} | sold "
                       f"{pos['contracts']:.0f}x both legs at bids (estimated mismatch "
