@@ -17,6 +17,45 @@ def kalshi_fee_per_contract(price: float) -> float:
     return 0.07 * price * (1 - price)
 
 
+def walk_bundle_depth(leg_a_asks: list, leg_b_asks: list, has_fee: bool,
+                      slippage_buffer: float) -> tuple:
+    """Walk BOTH leg order books simultaneously (not just best-of-book),
+    accumulating matched contracts (1 unit from each leg per bundle
+    contract) while the MARGINAL combined cost of the next unit stays
+    profitable. Bundles are mismatch-proof (one venue, one referee), so
+    unlike cross-venue trades there's no reason to cap size at the single
+    best price level - walking deeper captures real, still-profitable size
+    that books.best() alone was leaving on the table. Each leg's depth is
+    consumed independently, so a thinner leg naturally caps the achievable
+    size without artificially capping it down to whichever level happens
+    to be listed first. Returns (contracts, total_cost, total_fee)."""
+    i, j = 0, 0
+    rem_a = leg_a_asks[0][1] if leg_a_asks else 0.0
+    rem_b = leg_b_asks[0][1] if leg_b_asks else 0.0
+    total_qty = total_cost = total_fee = 0.0
+    while i < len(leg_a_asks) and j < len(leg_b_asks):
+        pa, pb = leg_a_asks[i][0], leg_b_asks[j][0]
+        marginal_fee = (kalshi_fee_per_contract(pa) + kalshi_fee_per_contract(pb)) \
+            if has_fee else 0.0
+        if pa + pb + marginal_fee >= 1 - slippage_buffer:
+            break   # next unit is no longer profitable - stop walking deeper
+        take = min(rem_a, rem_b)
+        if take <= 0:
+            break
+        total_qty += take
+        total_cost += take * (pa + pb)
+        total_fee += take * marginal_fee
+        rem_a -= take
+        rem_b -= take
+        if rem_a <= 1e-9:
+            i += 1
+            rem_a = leg_a_asks[i][1] if i < len(leg_a_asks) else 0.0
+        if rem_b <= 1e-9:
+            j += 1
+            rem_b = leg_b_asks[j][1] if j < len(leg_b_asks) else 0.0
+    return total_qty, total_cost, total_fee
+
+
 def find_arbs(match: dict, cfg: dict) -> list:
     """Check both directions for one matched pair. Returns list of opportunity dicts."""
     k = match["kalshi"]
@@ -98,15 +137,21 @@ def find_arbs(match: dict, cfg: dict) -> list:
     # no min-edge threshold (any positive edge is free money), no expiry-timing
     # floor (handled above - bundles run regardless of cross_venue_ok).
     bundles = [
-        ("bundle_kalshi", "kalshi", books.best(k_yes_asks), books.best(k_no_asks), True),
-        ("bundle_poly", "poly", books.best(p_yes_asks), books.best(p_no_asks), False),
+        ("bundle_kalshi", "kalshi", k_yes_asks, k_no_asks, True),
+        ("bundle_poly", "poly", p_yes_asks, p_no_asks, False),
     ]
-    for label, venue, leg_a, leg_b, has_fee in bundles:
-        if not leg_a or not leg_b:
+    for label, venue, leg_a_asks, leg_b_asks, has_fee in bundles:
+        if not leg_a_asks or not leg_b_asks:
             continue
-        combined = leg_a[0] + leg_b[0]
-        fee_pc = (kalshi_fee_per_contract(leg_a[0]) +
-                  kalshi_fee_per_contract(leg_b[0])) if has_fee else 0.0
+        # walk full depth on both legs - not just the best level - since
+        # bundles carry no mismatch risk and any profitable size is worth
+        # taking (see walk_bundle_depth above)
+        qty, cost, fee = walk_bundle_depth(leg_a_asks, leg_b_asks, has_fee,
+                                           cfg["slippage_buffer"])
+        if qty <= 0:
+            continue
+        combined = cost / qty        # avg combined per-contract price across the walk
+        fee_pc = fee / qty           # avg per-contract fee across the walk
         net_edge = 1 - (combined + fee_pc) - cfg["slippage_buffer"]
         if net_edge <= 0:   # any genuine positive edge counts - no min_net_edge floor
             continue
@@ -121,7 +166,7 @@ def find_arbs(match: dict, cfg: dict) -> list:
             "kalshi_price": round(combined, 4) if venue == "kalshi" else 0.0,
             "fee_per_contract": round(fee_pc, 4),
             "net_edge": round(net_edge, 4),
-            "book_contracts": min(leg_a[1], leg_b[1]),
+            "book_contracts": qty,
             "time_to_expiry_s": int(tte),
             "match_score": match["score"],
             "align_conf": match["align_conf"],
