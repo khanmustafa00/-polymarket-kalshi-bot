@@ -347,6 +347,10 @@ class BotWorker(threading.Thread):
                             continue
                         if n_open and time.time() - last_ts < cfg.get("reentry_cooldown_seconds", 90):
                             continue
+                        # don't buy back into a market this bot's own gap
+                        # monitor already flagged and exited once this window
+                        if paper.pair_was_gap_exited(positions, opp["pair_key"]):
+                            continue
                     sized = arb.size_position(opp, cfg, paper.deployed_usd(positions), realized)
                     if sized:
                         pos = paper.open_position(positions, sized, m)

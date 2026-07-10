@@ -99,6 +99,14 @@ def scan_cycle(matches, cfg, positions, trade: bool):
                         continue
                     if n_open and time.time() - last_ts < cfg.get("reentry_cooldown_seconds", 90):
                         continue
+                    # a gap-monitor exit means THIS bot's own risk model just
+                    # flagged this exact market as dangerous - don't buy back
+                    # in for the rest of that window's life (max_positions_per_pair
+                    # alone doesn't stop this: an exit frees the "open" slot
+                    # immediately, so without this check the bot can re-enter,
+                    # get exited again, and repeat all the way to expiry)
+                    if paper.pair_was_gap_exited(positions, opp["pair_key"]):
+                        continue
                 sized = arb.size_position(opp, cfg, paper.deployed_usd(positions), realized)
                 if sized:
                     pos = paper.open_position(positions, sized, m)

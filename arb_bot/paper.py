@@ -72,6 +72,19 @@ def pair_entries(positions: list, pair_key: str) -> tuple:
     return len(opens), max((p["opened_at"] for p in opens), default=0.0)
 
 
+def pair_was_gap_exited(positions: list, pair_key: str) -> bool:
+    """True if any position (open or settled) on this exact pair_key was ever
+    gap-monitor-exited. max_positions_per_pair only limits CONCURRENTLY open
+    positions - a gap-exit immediately frees that slot, so without this check
+    the bot can re-enter a market its own risk model just flagged, get
+    exited again, and repeat for the rest of that window's life (observed:
+    3 re-entries/re-exits on one XRP window, 5 on one BNB window). pair_key
+    is unique per specific 15-min market instance, so this naturally stops
+    mattering once that window expires and a new pair_key is generated."""
+    return any(p["pair_key"] == pair_key and p.get("gap_monitor_exit")
+               for p in positions)
+
+
 def open_position(positions: list, sized_opp: dict, match: dict):
     pos = dict(sized_opp)
     pos["status"] = "open"
