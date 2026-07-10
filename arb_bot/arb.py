@@ -1,4 +1,6 @@
 """Arb detection over matched pairs, with Kalshi fees and position sizing."""
+from __future__ import annotations
+
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor

@@ -14,6 +14,8 @@ Start/Stop runs the same watch loop as `run.py watch` in a background thread.
 Do NOT run this at the same time as `run.py watch` in another terminal -
 both would write data/positions.json.
 """
+from __future__ import annotations
+
 import json
 import os
 import queue
