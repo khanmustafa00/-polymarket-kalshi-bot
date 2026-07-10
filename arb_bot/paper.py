@@ -413,9 +413,11 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
     window = cfg.get("gap_monitor_window_seconds", 300)
     auto_exit = cfg.get("gap_monitor_auto_exit", 1)
     cutoff = cfg.get("poly_trade_cutoff_seconds", 20)
+    partial_pct = cfg.get("gap_monitor_partial_exit_pct", 0.5)
     refs = load_gap_refs()
     now = time.time()
     exited = []
+    new_records = []   # sold-off portions of partial exits, appended after the loop
     for pos in positions:
         if pos["status"] != "open" or pos.get("bundle"):
             continue
@@ -453,13 +455,15 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
                 p_bids = books.poly_bids(pos["poly_token_id"])
                 if yes_bids and no_bids and p_bids:
                     n = pos["contracts"]
+                    # EV decision is evaluated on the FULL current position -
+                    # the trigger question is "is this position worth cutting
+                    # at all", independent of how much gets sold once triggered
                     k_bids = yes_bids if pos["kalshi_side"] == "yes" else no_bids
-                    k_proceeds, k_fee = _walk_sell(k_bids, n, kalshi_fee=True)
-                    p_proceeds, _ = _walk_sell(p_bids, n)
-                    exit_fee = math.ceil(k_fee * 100) / 100
-                    p_cost = pos.get("poly_cost_usd", round(n * pos["poly_price"], 2))
-                    k_cost = pos.get("kalshi_cost_usd", round(n * pos["kalshi_price"], 2))
-                    ev_exit = k_proceeds + p_proceeds - pos["cost_usd"] - pos["fee_usd"] - exit_fee
+                    k_proceeds_full, k_fee_full = _walk_sell(k_bids, n, kalshi_fee=True)
+                    p_proceeds_full, _ = _walk_sell(p_bids, n)
+                    exit_fee_full = math.ceil(k_fee_full * 100) / 100
+                    ev_exit = (k_proceeds_full + p_proceeds_full - pos["cost_usd"]
+                              - pos["fee_usd"] - exit_fee_full)
                     pnl_hold_clean = pos.get("expected_profit_usd", 0.0)
                     pnl_hold_both_win = 2 * n - pos["cost_usd"] - pos["fee_usd"]
                     pnl_hold_both_lose = -(pos["cost_usd"] + pos["fee_usd"])
@@ -471,19 +475,65 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
                     record["p_both_win"] = round(probs["p_both_win"], 4)
                     record["p_both_lose"] = round(probs["p_both_lose"], 4)
                     if ev_exit > ev_hold:
-                        pos["status"] = "settled"
-                        pos["settled_at"] = now
-                        pos["gap_monitor_exit"] = True
-                        pos["gap_monitor_risk_score"] = round(risk_score, 4)
-                        pos["exit_fee_usd"] = exit_fee
-                        pos["resolution_mismatch"] = False
-                        pos["winning_leg"] = "gap-monitor-exit"
-                        pos["poly_pnl_usd"] = round(p_proceeds - p_cost, 2)
-                        pos["kalshi_pnl_usd"] = round(k_proceeds - k_cost - pos["fee_usd"]
-                                                      - exit_fee, 2)
-                        pos["pnl_usd"] = round(ev_exit, 2)
+                        # sell only a fraction, keep the rest open riding to
+                        # real settlement - a single-contract position can't
+                        # be meaningfully split, so fall back to a full exit
+                        sell_n = math.floor(n * partial_pct) if n > 1 else n
+                        sell_n = max(sell_n, 1)
+                        keep_n = n - sell_n
+                        k_proceeds, k_fee = (k_proceeds_full, k_fee_full) if sell_n == n \
+                            else _walk_sell(k_bids, sell_n, kalshi_fee=True)
+                        p_proceeds, _ = (p_proceeds_full, None) if sell_n == n \
+                            else _walk_sell(p_bids, sell_n)
+                        exit_fee = math.ceil(k_fee * 100) / 100
+                        p_cost = round(sell_n * pos["poly_price"], 2)
+                        k_cost = round(sell_n * pos["kalshi_price"], 2)
+                        sold_fee = round(pos["fee_usd"] * sell_n / n, 2)
+                        # the settled record for the sold portion: mutate pos
+                        # IN PLACE when it's a full exit (keep_n == 0, no
+                        # separate record needed - same as before this
+                        # feature existed), or a fresh copy when splitting
+                        # off part of a position that stays open
+                        target_rec = pos if keep_n <= 0 else dict(pos)
+                        target_rec["contracts"] = sell_n
+                        target_rec["poly_cost_usd"] = p_cost
+                        target_rec["kalshi_cost_usd"] = k_cost
+                        target_rec["cost_usd"] = round(p_cost + k_cost, 2)
+                        target_rec["fee_usd"] = sold_fee
+                        target_rec["status"] = "settled"
+                        target_rec["settled_at"] = now
+                        target_rec["gap_monitor_exit"] = True
+                        target_rec["gap_monitor_risk_score"] = round(risk_score, 4)
+                        target_rec["gap_monitor_partial"] = keep_n > 0
+                        target_rec["exit_fee_usd"] = exit_fee
+                        target_rec["resolution_mismatch"] = False
+                        target_rec["winning_leg"] = "gap-monitor-exit"
+                        target_rec["poly_pnl_usd"] = round(p_proceeds - p_cost, 2)
+                        target_rec["kalshi_pnl_usd"] = round(k_proceeds - k_cost - sold_fee
+                                                             - exit_fee, 2)
+                        target_rec["pnl_usd"] = round(k_proceeds + p_proceeds
+                                                       - target_rec["cost_usd"]
+                                                       - sold_fee - exit_fee, 2)
+                        exited.append(target_rec)
                         record["exited"] = True
-                        exited.append(pos)
+                        record["sold_contracts"] = sell_n
+                        record["kept_contracts"] = keep_n
+                        if keep_n > 0:
+                            # separate record for the sold part - append it,
+                            # and shrink the ORIGINAL pos to what's left,
+                            # which stays open and keeps getting checked/
+                            # settled normally. This pair_key is still
+                            # blocked from NEW entries by
+                            # pair_was_gap_exited() regardless
+                            new_records.append(target_rec)
+                            pos["contracts"] = keep_n
+                            pos["poly_cost_usd"] = round(keep_n * pos["poly_price"], 2)
+                            pos["kalshi_cost_usd"] = round(keep_n * pos["kalshi_price"], 2)
+                            pos["cost_usd"] = round(pos["poly_cost_usd"]
+                                                    + pos["kalshi_cost_usd"], 2)
+                            pos["fee_usd"] = round(pos["fee_usd"] - sold_fee, 2)
+                            pos["expected_profit_usd"] = round(
+                                pos.get("expected_profit_usd", 0.0) * keep_n / n, 2)
             except Exception:
                 pass   # book fetch failed; leave position open, retry next cycle
         try:
@@ -491,6 +541,8 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
                 f.write(json.dumps(record) + "\n")
         except OSError:
             pass
+    if new_records:
+        positions.extend(new_records)
     if exited:
         save_positions(positions)
     return exited

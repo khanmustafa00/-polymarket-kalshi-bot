@@ -71,6 +71,19 @@ DEFAULTS = {
                                                 # is never sold on a coin-flip-ish
                                                 # read, only on genuinely high-
                                                 # confidence mismatch risk
+    "gap_monitor_partial_exit_pct": 0.5,    # sell only this fraction of the
+                                            # position when conditions fire,
+                                            # instead of all of it - locks in a
+                                            # smaller guaranteed loss now while
+                                            # keeping the rest riding to real
+                                            # settlement, so a favorable move
+                                            # in the final minutes isn't fully
+                                            # missed. Repeated high-risk cycles
+                                            # naturally scale the remainder
+                                            # down further each time (each
+                                            # check acts on whatever contracts
+                                            # are currently left). 1.0 = full
+                                            # exit, same as before this existed
     "gap_monitor_mc_samples": 20000,        # Monte Carlo samples per check
                                             # (numpy-vectorized, ~ms-scale cost)
     "gap_monitor_window_seconds": 300,      # only check within this many seconds
@@ -138,6 +151,7 @@ FIELD_HELP = [
     ("gap_monitor_enabled", "Underlying-price gap monitor: Monte Carlo mismatch-probability model (0 = off)"),
     ("gap_monitor_auto_exit", "1 = actually sell both legs when flagged; 0 = log only, no action"),
     ("gap_monitor_probability_threshold", "Hard floor: exit only ever considered above this mismatch probability (default 0.75); the EV check still has to separately agree"),
+    ("gap_monitor_partial_exit_pct", "Fraction of the position sold when conditions fire (0.5 = half); the rest keeps riding to real settlement. 1.0 = full exit"),
     ("gap_monitor_mc_samples", "Monte Carlo samples per check - higher = more precise, still fast (numpy-vectorized)"),
     ("gap_monitor_window_seconds", "Only check the gap within this many seconds of expiry"),
     ("gap_monitor_volatility_lookback_minutes", "How much 1-min candle history to average for each asset's typical move"),
