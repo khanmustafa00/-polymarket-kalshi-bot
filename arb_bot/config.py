@@ -61,8 +61,16 @@ DEFAULTS = {
     "gap_monitor_enabled": 1,               # 0 = off entirely
     "gap_monitor_auto_exit": 1,             # 1 = ACTUALLY SELL both legs when
                                             # flagged (not just log); 0 = log-only
-    "gap_monitor_probability_threshold": 0.30,  # flag/exit if estimated mismatch
-                                                # probability >= this
+    "gap_monitor_probability_threshold": 0.75,  # HARD FLOOR: exit is only ever
+                                                # considered if estimated mismatch
+                                                # probability >= this. The EV-aware
+                                                # check (paper.check_position_gaps)
+                                                # still has to separately agree
+                                                # exiting beats holding - this floor
+                                                # exists on top of that so a position
+                                                # is never sold on a coin-flip-ish
+                                                # read, only on genuinely high-
+                                                # confidence mismatch risk
     "gap_monitor_mc_samples": 20000,        # Monte Carlo samples per check
                                             # (numpy-vectorized, ~ms-scale cost)
     "gap_monitor_window_seconds": 300,      # only check within this many seconds
@@ -122,7 +130,7 @@ FIELD_HELP = [
     ("mid_price_guard", "Skip trades priced within this band of $0.50 (mismatch guard); 0 = off"),
     ("gap_monitor_enabled", "Underlying-price gap monitor: Monte Carlo mismatch-probability model (0 = off)"),
     ("gap_monitor_auto_exit", "1 = actually sell both legs when flagged; 0 = log only, no action"),
-    ("gap_monitor_probability_threshold", "Sell if estimated mismatch probability is >= this (backtested best: 0.30)"),
+    ("gap_monitor_probability_threshold", "Hard floor: exit only ever considered above this mismatch probability (default 0.75); the EV check still has to separately agree"),
     ("gap_monitor_mc_samples", "Monte Carlo samples per check - higher = more precise, still fast (numpy-vectorized)"),
     ("gap_monitor_window_seconds", "Only check the gap within this many seconds of expiry"),
     ("gap_monitor_volatility_lookback_minutes", "How much 1-min candle history to average for each asset's typical move"),

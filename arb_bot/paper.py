@@ -358,10 +358,12 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
     lift over random).
 
     ACTIVE (gap_monitor_auto_exit, default on): gap_monitor_probability_threshold
-    is only a cheap PRE-SCREEN to decide whether it's worth fetching order
-    books at all. The actual exit decision is EV-aware and directional
-    (spot.hold_outcome_probs), not a flat probability cutoff. A flat cutoff
-    alone is not enough here - these are thin-edge trades (max_net_edge caps
+    (default 0.75) is a HARD FLOOR - exiting is never even considered below
+    it, so a position is never sold on a mere coin-flip-ish read. Above that
+    floor, the exit decision is additionally EV-aware and directional
+    (spot.hold_outcome_probs), not just the flat probability cutoff by
+    itself - both have to agree. A flat cutoff alone is not enough here -
+    these are thin-edge trades (max_net_edge caps
     the locked profit at a few cents), so even a real ~30-50% mismatch
     probability doesn't justify eating exit slippage that's often many times
     the edge being protected - AND a "mismatch" isn't always a full loss:
