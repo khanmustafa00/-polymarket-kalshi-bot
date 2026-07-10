@@ -100,9 +100,16 @@ DEFAULTS = {
     "mid_price_guard": 0.2,         # skip trades priced within this band of $0.50
                                     # (hovering at the reference = venues may
                                     # disagree on the result); 0 disables
-    "blacklist": [],                # title substrings never to match/trade,
-                                    # e.g. ["sol"] blocks SOL & Solana markets
-                                    # (edit config.json directly - not in the
+    "blacklist": ["hype"],           # title substrings never to match/trade.
+                                    # HYPE is blocked by default: it has no
+                                    # Binance spot listing (see spot.py's
+                                    # SYMBOL_MAP), so the gap monitor can never
+                                    # compute a risk score for it - every HYPE
+                                    # position is a total blind spot, gap-
+                                    # monitor protection or not. Add more
+                                    # entries e.g. ["hype", "sol"] to also
+                                    # block SOL & Solana markets (edit
+                                    # config.json directly - not in the
                                     # numeric settings forms)
 
     # matching
