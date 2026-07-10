@@ -36,16 +36,33 @@ def _bot_box() -> dict:
     return {"proc": None}
 
 
-def bot_running() -> bool:
+def own_bot_running() -> bool:
+    """True only if THIS app's Start button launched the currently-alive process."""
     p = _bot_box()["proc"]
     return p is not None and p.poll() is None
+
+
+def bot_running() -> bool:
+    """True if a bot is running at all, however it was started - own subprocess,
+    the tkinter GUI, plain `run.py watch`, or (the AWS/Linux case) a systemd
+    service. Uses the same cross-platform bot.lock heartbeat the bot itself
+    uses for its own single-instance guard, so this is accurate regardless of
+    OS or launch method - unlike the old PID-scanning approach below, which
+    was Windows-only and always reported "stopped" for a systemd-managed bot."""
+    if own_bot_running():
+        return True
+    return paper.lock_alive(max(3 * load_config().get("poll_seconds", 3), 30))
 
 
 def external_bot_pids() -> list:
     """PIDs of `run.py watch` processes NOT started by this app (CLI, GUI, orphans).
 
     Windows-only check (uses PowerShell/CIM); on other platforms - e.g. a
-    Streamlit Community Cloud Linux container - this always returns []."""
+    Streamlit Community Cloud Linux container, or this app's own AWS/systemd
+    deployment - this always returns []. bot_running() (above) still detects
+    those cases via the lock heartbeat; this function just can't name a PID
+    for them, so the sidebar falls back to a generic "externally managed"
+    notice instead of a killable PID list."""
     if platform.system() != "Windows":
         return []
     try:
@@ -82,8 +99,18 @@ def venue_buys(p: dict) -> tuple:
 # ------------------------------------------------------------- sidebar
 with st.sidebar:
     st.title("Bot control")
-    running = bot_running()
-    st.markdown(f"**Status:** {':green[running]' if running else ':gray[stopped]'}")
+    own = own_bot_running()
+    running = own or bot_running()
+    externally_managed = running and not own   # e.g. systemd, CLI, tkinter GUI
+
+    if externally_managed:
+        st.markdown("**Status:** :green[running] _(externally managed - e.g. "
+                     "systemd/CLI, not started from this page)_")
+        st.caption("This page can't start/stop a bot it didn't launch. On the "
+                   "AWS deployment, use `sudo systemctl stop arbbot` / "
+                   "`start arbbot` on the server instead.")
+    else:
+        st.markdown(f"**Status:** {':green[running]' if running else ':gray[stopped]'}")
 
     strays = external_bot_pids()
     if strays:
@@ -104,16 +131,21 @@ with st.sidebar:
                  help="Launches `run.py watch` as a background process. It scans "
                       "order books, paper-trades opportunities and settles expired "
                       "positions. Output goes to data_watch_log.txt. Only ONE bot "
-                      "can run - this button is shared across all browser tabs."):
+                      "can run - this button is shared across all browser tabs. "
+                      "Disabled whenever a bot is already running anywhere "
+                      "(detected via data/bot.lock), including systemd."):
         logf = open(WATCH_LOG, "a")
         _bot_box()["proc"] = subprocess.Popen(
             [sys.executable, "-u", "run.py", "watch"],
             cwd=ROOT, stdout=logf, stderr=subprocess.STDOUT)
         time.sleep(1)
         st.rerun()
-    if c2.button("Stop bot", disabled=not running, use_container_width=True,
-                 help="Terminates the watch process. All positions are already "
-                      "saved on every change - nothing is lost."):
+    if c2.button("Stop bot", disabled=not own, use_container_width=True,
+                 help="Terminates the watch process THIS page launched. Disabled "
+                      "when the running bot was started elsewhere (systemd/CLI/"
+                      "GUI) - this page can't safely stop a process it doesn't "
+                      "own. All positions are already saved on every change - "
+                      "nothing is lost either way."):
         _bot_box()["proc"].terminate()
         time.sleep(1)
         paper.clear_lock()   # terminated process can't clean its own lock
