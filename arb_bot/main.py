@@ -61,11 +61,12 @@ def build_matches(cfg):
 
 
 def scan_cycle(matches, cfg, positions, trade: bool):
+    """Cross-venue only (bundles run separately - see bundle_scan_cycle - on
+    their own faster, independent cadence via a background thread)."""
     t0 = time.perf_counter()
     tradeable = [m for m in matches if m["score"] >= cfg["match_score_trade"]
                  and m["align_conf"] >= 0.5][:cfg["max_pairs_per_cycle"]]
     checked = 0
-    realized = sum(p["pnl_usd"] for p in positions if p["status"] == "settled")
     day_pnl = sum(p["pnl_usd"] for p in positions if p["status"] == "settled"
                   and p.get("settled_at", 0) > time.time() - 86400)
     limit = cfg.get("daily_loss_limit_usd", 0)
@@ -79,7 +80,7 @@ def scan_cycle(matches, cfg, positions, trade: bool):
     # order books are fetched in parallel; trading decisions stay sequential
     workers = max(1, int(cfg.get("book_workers", 8)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for m, opps in ex.map(lambda m: (m, arb.find_arbs(m, cfg)), tradeable):
+        for m, opps in ex.map(lambda m: (m, arb.find_cross_venue_arbs(m, cfg)), tradeable):
             checked += 1
             for opp in opps:
                 paper.log_opportunity(opp)
@@ -89,11 +90,13 @@ def scan_cycle(matches, cfg, positions, trade: bool):
                       f"| depth {opp['book_contracts']:.0f} | {opp['kalshi_title'][:50]}")
                 if not trade or loss_locked:
                     continue
-                if not opp.get("bundle"):
-                    # scale-in / re-entry limits exist because a PERSISTENT
-                    # cross-venue edge is usually a referee-divergence trap, not
-                    # a real repeatable lag. Bundles carry no such risk, so they
-                    # bypass this entirely - scale in as many times as it recurs.
+                # scale-in / re-entry limits exist because a PERSISTENT
+                # cross-venue edge is usually a referee-divergence trap, not
+                # a real repeatable lag.
+                # lock guards this whole read-decide-mutate-save sequence
+                # against the separate bundle thread also opening positions
+                # concurrently (see paper.positions_lock)
+                with paper.positions_lock:
                     n_open, last_ts = paper.pair_entries(positions, opp["pair_key"])
                     if n_open >= cfg.get("max_positions_per_pair", 3):
                         continue
@@ -107,14 +110,61 @@ def scan_cycle(matches, cfg, positions, trade: bool):
                     # get exited again, and repeat all the way to expiry)
                     if paper.pair_was_gap_exited(positions, opp["pair_key"]):
                         continue
-                sized = arb.size_position(opp, cfg, paper.deployed_usd(positions), realized)
-                if sized:
-                    pos = paper.open_position(positions, sized, m)
-                    print(f"[{_now()}] PAPER TRADE: {leg_breakdown(pos)} "
-                          f"| total ${pos['cost_usd'] + pos['fee_usd']:.2f}, payout $"
-                          f"{pos['contracts']:.2f}, locked +${pos['expected_profit_usd']}")
+                    realized = sum(p["pnl_usd"] for p in positions if p["status"] == "settled")
+                    sized = arb.size_position(opp, cfg, paper.deployed_usd(positions), realized)
+                    if sized:
+                        pos = paper.open_position(positions, sized, m)
+                        print(f"[{_now()}] PAPER TRADE: {leg_breakdown(pos)} "
+                              f"| total ${pos['cost_usd'] + pos['fee_usd']:.2f}, payout $"
+                              f"{pos['contracts']:.2f}, locked +${pos['expected_profit_usd']}")
     scan_cycle.last_ms = (time.perf_counter() - t0) * 1000
     return checked
+
+
+def bundle_scan_cycle(matches, cfg, positions, trade: bool) -> int:
+    """Mismatch-proof single-venue bundles only, on their own faster
+    cadence (bundle_poll_seconds) independent of scan_cycle's cross-venue
+    polling. No re-entry limits - bundles carry no risk, so scale in as
+    many times as the opportunity recurs (same policy scan_cycle already
+    used for bundles before they were split out)."""
+    t0 = time.perf_counter()
+    tradeable = [m for m in matches if m["score"] >= cfg["match_score_trade"]
+                 and m["align_conf"] >= 0.5][:cfg["max_pairs_per_cycle"]]
+    checked = 0
+    workers = max(1, int(cfg.get("book_workers", 8)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for m, opps in ex.map(lambda m: (m, arb.find_bundles(m, cfg)), tradeable):
+            checked += 1
+            for opp in opps:
+                paper.log_opportunity(opp)
+                print(f"[{_now()}] BUNDLE {opp['net_edge']*100:.1f}c/contract "
+                      f"| {opp['direction']} | depth {opp['book_contracts']:.0f} "
+                      f"| {opp['kalshi_title'][:50]}")
+                if not trade:
+                    continue
+                with paper.positions_lock:
+                    realized = sum(p["pnl_usd"] for p in positions if p["status"] == "settled")
+                    sized = arb.size_position(opp, cfg, paper.deployed_usd(positions), realized)
+                    if sized:
+                        pos = paper.open_position(positions, sized, m)
+                        print(f"[{_now()}] BUNDLE TRADE: {leg_breakdown(pos)} "
+                              f"| total ${pos['cost_usd'] + pos['fee_usd']:.2f}, payout $"
+                              f"{pos['contracts']:.2f}, locked +${pos['expected_profit_usd']}")
+    bundle_scan_cycle.last_ms = (time.perf_counter() - t0) * 1000
+    return checked
+
+
+def _bundle_loop(cfg, positions, mstate, stop_event):
+    """Background thread: scans bundles only, at bundle_poll_seconds cadence,
+    completely independent of the main watch loop's poll_seconds cadence."""
+    while not stop_event.is_set():
+        try:
+            n = bundle_scan_cycle(mstate["matches"], cfg, positions, trade=True)
+            print(f"[{_now()}] bundle scan {bundle_scan_cycle.last_ms:.0f}ms "
+                  f"({n} pairs checked)")
+        except Exception as e:
+            print(f"[{_now()}] bundle cycle error: {e!r} - continuing")
+        stop_event.wait(cfg.get("bundle_poll_seconds", 1))
 
 
 def cmd_scan(cfg):
@@ -128,7 +178,9 @@ def cmd_scan(cfg):
     positions = paper.load_positions()
     print(f"\n--- checking books on pairs with score >= {cfg['match_score_trade']} ---")
     n = scan_cycle(matches, cfg, positions, trade=False)
-    print(f"[{_now()}] checked {n} pairs (scan mode: opportunities logged, no trades)")
+    nb = bundle_scan_cycle(matches, cfg, positions, trade=False)
+    print(f"[{_now()}] checked {n} cross-venue + {nb} bundle pairs "
+          f"(scan mode: opportunities logged, no trades)")
 
 
 def _refresh_into(cfg, out: dict):
@@ -148,10 +200,22 @@ def cmd_watch(cfg):
         return
     positions = paper.load_positions()
     matches, last_refresh = [], 0.0
+    mstate = {"matches": matches}   # shared with the bundle thread below
     refresh_thread, refresh_box = None, {}
     last_summary = ""
     print(f"[{_now()}] watch started | portfolio ${cfg['portfolio_usd']} "
           f"| per-trade {cfg['per_trade_pct']*100:.0f}% | aggregate {cfg['aggregate_pct']*100:.0f}%")
+
+    # bundles run on their own faster, independent cadence (bundle_poll_seconds)
+    # in a background thread - see arb.find_bundles / bundle_scan_cycle. Position
+    # mutations from both threads go through paper.positions_lock so they can't
+    # race each other into double-spending budget or corrupting positions.json
+    bundle_stop = threading.Event()
+    bundle_thread = threading.Thread(target=_bundle_loop,
+                                     args=(cfg, positions, mstate, bundle_stop),
+                                     daemon=True)
+    bundle_thread.start()
+
     while True:
         try:
             paper.touch_lock()
@@ -159,6 +223,7 @@ def cmd_watch(cfg):
             if refresh_thread and not refresh_thread.is_alive():
                 if "matches" in refresh_box:
                     matches = refresh_box["matches"]
+                    mstate["matches"] = matches
                 else:
                     print(f"[{_now()}] refresh error: {refresh_box.get('error')!r} - continuing")
                 refresh_thread = None
@@ -172,25 +237,26 @@ def cmd_watch(cfg):
             checked = scan_cycle(matches, cfg, positions, trade=True)
             print(f"[{_now()}] book scan {scan_cycle.last_ms:.0f}ms "
                   f"({checked} pairs checked)")
-            for pos in paper.check_position_gaps(positions, cfg):
-                print(f"[{_now()}] GAP MONITOR EXIT pnl ${pos['pnl_usd']} | sold "
-                      f"{pos['contracts']:.0f}x both legs at bids (estimated mismatch "
-                      f"probability {pos['gap_monitor_risk_score']*100:.1f}%) "
-                      f"| {pos['kalshi_title'][:45]}")
-            # DANGER EXIT PAUSED (2026-07-09): backtest showed 3 of 4 verified
-            # exits were false positives (cost more than holding would have) -
-            # paused while the new gap-monitor probability model (above) is
-            # validated as a replacement. Uncomment to re-enable.
-            # for pos in paper.danger_exits(positions, cfg):
-            #     print(f"[{_now()}] DANGER EXIT pnl ${pos['pnl_usd']} | sold "
-            #           f"{pos['contracts']:.0f}x both legs at bids (market re-entered "
-            #           f"the {cfg.get('danger_band', 0):.2f} band near expiry) "
-            #           f"| {pos['kalshi_title'][:45]}")
-            for pos in paper.settle(positions):
-                tag = " *** RESOLUTION MISMATCH ***" if pos["resolution_mismatch"] else ""
-                print(f"[{_now()}] SETTLED pnl ${pos['pnl_usd']}{tag} "
-                      f"| {settle_breakdown(pos)} | {pos['kalshi_title'][:50]}")
-            s = paper.summary(positions)
+            with paper.positions_lock:
+                for pos in paper.check_position_gaps(positions, cfg):
+                    print(f"[{_now()}] GAP MONITOR EXIT pnl ${pos['pnl_usd']} | sold "
+                          f"{pos['contracts']:.0f}x both legs at bids (estimated mismatch "
+                          f"probability {pos['gap_monitor_risk_score']*100:.1f}%) "
+                          f"| {pos['kalshi_title'][:45]}")
+                # DANGER EXIT PAUSED (2026-07-09): backtest showed 3 of 4 verified
+                # exits were false positives (cost more than holding would have) -
+                # paused while the new gap-monitor probability model (above) is
+                # validated as a replacement. Uncomment to re-enable.
+                # for pos in paper.danger_exits(positions, cfg):
+                #     print(f"[{_now()}] DANGER EXIT pnl ${pos['pnl_usd']} | sold "
+                #           f"{pos['contracts']:.0f}x both legs at bids (market re-entered "
+                #           f"the {cfg.get('danger_band', 0):.2f} band near expiry) "
+                #           f"| {pos['kalshi_title'][:45]}")
+                for pos in paper.settle(positions):
+                    tag = " *** RESOLUTION MISMATCH ***" if pos["resolution_mismatch"] else ""
+                    print(f"[{_now()}] SETTLED pnl ${pos['pnl_usd']}{tag} "
+                          f"| {settle_breakdown(pos)} | {pos['kalshi_title'][:50]}")
+                s = paper.summary(positions)
             summary = (f"open {s['open_positions']} (${s['deployed_usd']}) "
                        f"| settled {s['settled_positions']} | pnl ${s['realized_pnl_usd']} "
                        f"| mismatches {s['resolution_mismatches']}")
@@ -205,6 +271,7 @@ def cmd_watch(cfg):
         except Exception as e:
             print(f"[{_now()}] cycle error: {e!r} - continuing")
             time.sleep(cfg["poll_seconds"])
+    bundle_stop.set()
     paper.clear_lock()
 
 

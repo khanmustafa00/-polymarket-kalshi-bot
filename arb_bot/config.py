@@ -131,7 +131,15 @@ DEFAULTS = {
     "expiry_tolerance_minutes": 20, # venue expiry times must be within this window
 
     # loop
-    "poll_seconds": 3,              # book scan interval (books fetched in parallel)
+    "poll_seconds": 3,              # cross-venue book scan interval (books fetched
+                                    # in parallel) - kept slower/more careful since
+                                    # cross-venue trades carry real mismatch risk
+    "bundle_poll_seconds": 1,       # SEPARATE, faster scan interval for bundles
+                                    # only - runs in its own thread, independent of
+                                    # the cross-venue loop above. Bundles are
+                                    # mismatch-proof (one venue, one referee), so
+                                    # there's no risk downside to polling them
+                                    # tighter to catch more fleeting windows
     "refresh_match_seconds": 300,   # market list + matching refresh interval;
                                     # the wide 12h window takes ~2-4 min to fetch
                                     # (sliced pagination), so this stays above that
@@ -172,7 +180,8 @@ FIELD_HELP = [
     ("match_score_trade", "Min match confidence to paper-trade a pair"),
     ("match_score_log", "Min match confidence to list a candidate pair"),
     ("expiry_tolerance_minutes", "Max expiry-time difference between venues (min)"),
-    ("poll_seconds", "Order-book scan interval (seconds)"),
+    ("poll_seconds", "Cross-venue order-book scan interval (seconds)"),
+    ("bundle_poll_seconds", "Separate, faster scan interval for mismatch-proof bundles only (seconds)"),
     ("refresh_match_seconds", "Market list + matching refresh interval (seconds)"),
     ("max_pairs_per_cycle", "Max order-book fetches per cycle"),
     ("request_gap_seconds", "Pause between API call starts (seconds)"),

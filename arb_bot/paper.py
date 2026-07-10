@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import threading
 import time
 
 from .config import data_dir
@@ -9,6 +10,12 @@ from .http import get_json
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 GAMMA_BASE = "https://gamma-api.polymarket.com"
+
+# guards every read-decide-mutate-save sequence against the shared `positions`
+# list/file, so the cross-venue scan loop and the separate, faster bundle scan
+# loop (both running as threads in main.py's cmd_watch) can't race each other
+# into double-spending the same budget or corrupting a concurrent file write
+positions_lock = threading.Lock()
 
 POSITIONS_PATH = os.path.join(data_dir(), "positions.json")
 OPPS_LOG = os.path.join(data_dir(), "opportunities.jsonl")

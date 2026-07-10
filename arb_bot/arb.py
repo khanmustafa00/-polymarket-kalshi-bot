@@ -56,8 +56,32 @@ def walk_bundle_depth(leg_a_asks: list, leg_b_asks: list, has_fee: bool,
     return total_qty, total_cost, total_fee
 
 
-def find_arbs(match: dict, cfg: dict) -> list:
-    """Check both directions for one matched pair. Returns list of opportunity dicts."""
+def _fetch_all_books(match: dict) -> tuple:
+    """Fetch Kalshi + both Polymarket outcome books in parallel, as close to
+    the same instant as possible (sequential fetches were ~0.5-1s apart,
+    letting 'edges' through that never existed at any single moment). Used
+    by both find_cross_venue_arbs and find_bundles independently - each
+    caller gets its own fresh snapshot, since they now run on separate
+    cadences (see main.py's bundle_scan_cycle vs scan_cycle)."""
+    k = match["kalshi"]
+    p = match["poly"]
+    yes_idx = match["poly_yes_idx"]
+    no_idx = 1 - yes_idx
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_k = ex.submit(books.kalshi_asks, k["raw"]["ticker"])
+        f_py = ex.submit(books.poly_asks, p["raw"]["token_ids"][yes_idx])
+        f_pn = ex.submit(books.poly_asks, p["raw"]["token_ids"][no_idx])
+        k_yes_asks, k_no_asks = f_k.result()
+        p_yes_asks = f_py.result()
+        p_no_asks = f_pn.result()
+    return k_yes_asks, k_no_asks, p_yes_asks, p_no_asks
+
+
+def find_cross_venue_arbs(match: dict, cfg: dict) -> list:
+    """Cross-venue (Kalshi vs Polymarket) opportunities only. Thin margins
+    and real resolution-mismatch risk here justify staying on the slower,
+    more heavily risk-filtered poll_seconds cadence - see find_bundles for
+    the mismatch-proof counterpart that can run faster and looser."""
     k = match["kalshi"]
     p = match["poly"]
     yes_idx = match["poly_yes_idx"]
@@ -66,23 +90,13 @@ def find_arbs(match: dict, cfg: dict) -> list:
     tte = min(k["expiry"], p["expiry"]) - now
     if tte <= 0:
         return []
-    # min_time_to_expiry_seconds exists to avoid the volatile last stretch on
-    # CROSS-VENUE trades (real mismatch risk near expiry). Bundles carry no
-    # such risk (one venue, one referee), so they're allowed arbitrarily late -
-    # this only gates whether the cross-venue directions loop runs below.
-    cross_venue_ok = tte >= cfg["min_time_to_expiry_seconds"]
+    # too close to expiry for a cross-oracle trade (real mismatch risk near
+    # expiry) - bundles have no such floor, see find_bundles
+    if tte < cfg["min_time_to_expiry_seconds"]:
+        return []
 
-    # fetch all three books in parallel so both venues are snapshotted as close
-    # to the same instant as possible (sequential fetches were ~0.5-1s apart,
-    # letting "edges" through that never existed at any single moment)
     try:
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            f_k = ex.submit(books.kalshi_asks, k["raw"]["ticker"])
-            f_py = ex.submit(books.poly_asks, p["raw"]["token_ids"][yes_idx])
-            f_pn = ex.submit(books.poly_asks, p["raw"]["token_ids"][no_idx])
-            k_yes_asks, k_no_asks = f_k.result()
-            p_yes_asks = f_py.result()
-            p_no_asks = f_pn.result()
+        k_yes_asks, k_no_asks, p_yes_asks, p_no_asks = _fetch_all_books(match)
     except Exception:
         return []
 
@@ -93,8 +107,6 @@ def find_arbs(match: dict, cfg: dict) -> list:
         ("poly_no+kalshi_yes", p_no_asks, k_yes_asks, "yes"),
     ]
     for label, poly_levels, kalshi_levels, k_side in directions:
-        if not cross_venue_ok:
-            break   # too close to expiry for a cross-oracle trade; bundles below are unaffected
         pb, kb = books.best(poly_levels), books.best(kalshi_levels)
         if not pb or not kb:
             continue
@@ -129,13 +141,33 @@ def find_arbs(match: dict, cfg: dict) -> list:
             "kalshi_title": k["title"],
             "poly_title": p["title"],
         })
+    return opps
 
-    # single-venue BUNDLES: YES + NO on ONE venue for < $1. One venue = one
-    # referee = resolution mismatch is impossible by construction; payout of
-    # $1/contract is a mathematical identity. Genuinely riskless, so NONE of
-    # the cross-venue risk filters apply: no mid-price guard, no max-edge cap,
-    # no min-edge threshold (any positive edge is free money), no expiry-timing
-    # floor (handled above - bundles run regardless of cross_venue_ok).
+
+def find_bundles(match: dict, cfg: dict) -> list:
+    """Single-venue BUNDLES only: YES + NO on ONE venue for < $1. One venue =
+    one referee = resolution mismatch is impossible by construction; payout
+    of $1/contract is a mathematical identity. Genuinely riskless, so NONE
+    of the cross-venue risk filters apply: no mid-price guard, no max-edge
+    cap, no min-edge threshold (any positive edge is free money), no
+    expiry-timing floor. Fetches its own fresh book snapshot independent of
+    find_cross_venue_arbs, so it can run on its own faster cadence
+    (bundle_poll_seconds) without being bottlenecked by cross-venue's
+    slower, more careful polling."""
+    k = match["kalshi"]
+    p = match["poly"]
+    yes_idx = match["poly_yes_idx"]
+    now = time.time()
+    tte = min(k["expiry"], p["expiry"]) - now
+    if tte <= 0:
+        return []
+
+    try:
+        k_yes_asks, k_no_asks, p_yes_asks, p_no_asks = _fetch_all_books(match)
+    except Exception:
+        return []
+
+    opps = []
     bundles = [
         ("bundle_kalshi", "kalshi", k_yes_asks, k_no_asks, True),
         ("bundle_poly", "poly", p_yes_asks, p_no_asks, False),
@@ -175,6 +207,15 @@ def find_arbs(match: dict, cfg: dict) -> list:
             "poly_title": p["title"],
         })
     return opps
+
+
+def find_arbs(match: dict, cfg: dict) -> list:
+    """Combined cross-venue + bundle opportunities on ONE shared book fetch.
+    Kept for callers that want both on the same cadence (the tkinter GUI).
+    The live watch loop (main.py) uses find_cross_venue_arbs and
+    find_bundles separately instead, so bundles can run on their own
+    faster, independent polling cadence."""
+    return find_cross_venue_arbs(match, cfg) + find_bundles(match, cfg)
 
 
 def size_position(opp: dict, cfg: dict, deployed_usd: float,
