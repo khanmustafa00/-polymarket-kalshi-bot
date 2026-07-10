@@ -279,13 +279,24 @@ class BotWorker(threading.Thread):
                     refresh_thread.start()
                 self.scan(matches, positions)
                 for pos in paper.check_position_gaps(positions, cfg):
-                    log_line(self.events,
-                             f"GAP MONITOR EXIT {pos['pnl_usd']:+.2f} USD | sold "
-                             f"{pos['contracts']:.0f}x both legs at bids (estimated "
-                             f"mismatch probability "
-                             f"{pos['gap_monitor_risk_score']*100:.1f}%) "
-                             f"| {pos['kalshi_title'][:45]}",
-                             "profit" if pos["pnl_usd"] >= 0 else "loss")
+                    if pos["status"] == "settled":
+                        trims = pos.get("gap_monitor_trim_count", 1)
+                        trim_note = f" ({trims} trims)" if trims > 1 else ""
+                        log_line(self.events,
+                                 f"GAP MONITOR EXIT {pos['pnl_usd']:+.2f} USD{trim_note} "
+                                 f"| sold {pos['contracts']:.0f}x both legs at bids total "
+                                 f"(estimated mismatch probability "
+                                 f"{pos['gap_monitor_risk_score']*100:.1f}%) "
+                                 f"| {pos['kalshi_title'][:45]}",
+                                 "profit" if pos["pnl_usd"] >= 0 else "loss")
+                    else:
+                        log_line(self.events,
+                                 f"GAP MONITOR PARTIAL EXIT | sold some contracts, "
+                                 f"{pos['contracts']:.0f}x still open (estimated "
+                                 f"mismatch probability "
+                                 f"{pos['gap_monitor_risk_score']*100:.1f}%) "
+                                 f"| {pos['kalshi_title'][:45]}",
+                                 "arb")
                 # DANGER EXIT PAUSED (2026-07-09): backtest showed 3 of 4
                 # verified exits were false positives (cost more than holding
                 # would have) - paused while the new gap-monitor probability

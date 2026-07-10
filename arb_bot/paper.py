@@ -409,7 +409,17 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
     Set gap_monitor_auto_exit to 0 to go back to logging only. Every check is
     logged to data/gap_monitor.jsonl regardless, flagged or not, exited or
     not - so the model can keep being validated against real outcomes.
-    Returns the list of positions actually exited this cycle."""
+    Partial exits accumulate onto the SAME position dict across every trim
+    (via _gap_sold_* running totals) instead of spinning off a new settled
+    record each time - a position trimmed 5 times across 5 cycles still
+    ends up as exactly ONE row in positions.json/the dashboard, with the
+    combined total result, not 5 separate small "losses". Only finalized
+    (status="settled") once fully consumed.
+
+    Returns positions touched this cycle - a MIX of still-open partial
+    trims (status stays "open", check pos["status"] before reading
+    pnl_usd/winning_leg/etc, which don't exist yet) and final closures
+    (status=="settled", fully populated pnl fields)."""
     from . import books, spot
     if not cfg.get("gap_monitor_enabled", 1) or not cfg.get("danger_band"):
         return []
@@ -423,8 +433,7 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
     partial_pct = cfg.get("gap_monitor_partial_exit_pct", 0.5)
     refs = load_gap_refs()
     now = time.time()
-    exited = []
-    new_records = []   # sold-off portions of partial exits, appended after the loop
+    exited = []   # only FINAL closures (status=="settled") - see below
     for pos in positions:
         if pos["status"] != "open" or pos.get("bundle"):
             continue
@@ -496,43 +505,40 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
                         p_cost = round(sell_n * pos["poly_price"], 2)
                         k_cost = round(sell_n * pos["kalshi_price"], 2)
                         sold_fee = round(pos["fee_usd"] * sell_n / n, 2)
-                        # the settled record for the sold portion: mutate pos
-                        # IN PLACE when it's a full exit (keep_n == 0, no
-                        # separate record needed - same as before this
-                        # feature existed), or a fresh copy when splitting
-                        # off part of a position that stays open
-                        target_rec = pos if keep_n <= 0 else dict(pos)
-                        target_rec["contracts"] = sell_n
-                        target_rec["poly_cost_usd"] = p_cost
-                        target_rec["kalshi_cost_usd"] = k_cost
-                        target_rec["cost_usd"] = round(p_cost + k_cost, 2)
-                        target_rec["fee_usd"] = sold_fee
-                        target_rec["status"] = "settled"
-                        target_rec["settled_at"] = now
-                        target_rec["gap_monitor_exit"] = True
-                        target_rec["gap_monitor_risk_score"] = round(risk_score, 4)
-                        target_rec["gap_monitor_partial"] = keep_n > 0
-                        target_rec["exit_fee_usd"] = exit_fee
-                        target_rec["resolution_mismatch"] = False
-                        target_rec["winning_leg"] = "gap-monitor-exit"
-                        target_rec["poly_pnl_usd"] = round(p_proceeds - p_cost, 2)
-                        target_rec["kalshi_pnl_usd"] = round(k_proceeds - k_cost - sold_fee
-                                                             - exit_fee, 2)
-                        target_rec["pnl_usd"] = round(k_proceeds + p_proceeds
-                                                       - target_rec["cost_usd"]
-                                                       - sold_fee - exit_fee, 2)
-                        exited.append(target_rec)
+                        trim_poly_pnl = round(p_proceeds - p_cost, 2)
+                        trim_kalshi_pnl = round(k_proceeds - k_cost - sold_fee - exit_fee, 2)
+
+                        # accumulate onto the SAME position across every trim,
+                        # instead of spinning off a new settled record each
+                        # time - a position that gets trimmed 5 times ends up
+                        # as ONE row in positions.json/the dashboard with the
+                        # total combined result, not 5 separate small "losses"
+                        pos["_gap_sold_contracts"] = pos.get("_gap_sold_contracts", 0) + sell_n
+                        pos["_gap_sold_cost"] = round(
+                            pos.get("_gap_sold_cost", 0.0) + p_cost + k_cost, 2)
+                        pos["_gap_sold_poly_cost"] = round(
+                            pos.get("_gap_sold_poly_cost", 0.0) + p_cost, 2)
+                        pos["_gap_sold_kalshi_cost"] = round(
+                            pos.get("_gap_sold_kalshi_cost", 0.0) + k_cost, 2)
+                        pos["_gap_sold_fee"] = round(
+                            pos.get("_gap_sold_fee", 0.0) + sold_fee, 2)
+                        pos["_gap_sold_exit_fee"] = round(
+                            pos.get("_gap_sold_exit_fee", 0.0) + exit_fee, 2)
+                        pos["_gap_sold_poly_pnl"] = round(
+                            pos.get("_gap_sold_poly_pnl", 0.0) + trim_poly_pnl, 2)
+                        pos["_gap_sold_kalshi_pnl"] = round(
+                            pos.get("_gap_sold_kalshi_pnl", 0.0) + trim_kalshi_pnl, 2)
+                        pos["_gap_trim_count"] = pos.get("_gap_trim_count", 0) + 1
                         record["exited"] = True
                         record["sold_contracts"] = sell_n
                         record["kept_contracts"] = keep_n
+                        record["trim_count"] = pos["_gap_trim_count"]
+
                         if keep_n > 0:
-                            # separate record for the sold part - append it,
-                            # and shrink the ORIGINAL pos to what's left,
-                            # which stays open and keeps getting checked/
-                            # settled normally. This pair_key is still
-                            # blocked from NEW entries by
-                            # pair_was_gap_exited() regardless
-                            new_records.append(target_rec)
+                            # still open - shrink to what's left for continued
+                            # monitoring/EV evaluation next cycle. pair_key is
+                            # already blocked from NEW entries by
+                            # pair_was_gap_exited() regardless of final status
                             pos["contracts"] = keep_n
                             pos["poly_cost_usd"] = round(keep_n * pos["poly_price"], 2)
                             pos["kalshi_cost_usd"] = round(keep_n * pos["kalshi_price"], 2)
@@ -541,6 +547,33 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
                             pos["fee_usd"] = round(pos["fee_usd"] - sold_fee, 2)
                             pos["expected_profit_usd"] = round(
                                 pos.get("expected_profit_usd", 0.0) * keep_n / n, 2)
+                            pos["gap_monitor_risk_score"] = round(risk_score, 4)
+                            exited.append(pos)   # informational only - status still "open"
+                        else:
+                            # fully consumed (this trim or an earlier one closed
+                            # it out) - finalize as ONE settled record using the
+                            # ACCUMULATED totals across every trim, not just this
+                            # last chunk
+                            pos["contracts"] = pos["_gap_sold_contracts"]
+                            pos["poly_cost_usd"] = pos["_gap_sold_poly_cost"]
+                            pos["kalshi_cost_usd"] = pos["_gap_sold_kalshi_cost"]
+                            pos["cost_usd"] = round(pos["poly_cost_usd"]
+                                                    + pos["kalshi_cost_usd"], 2)
+                            pos["fee_usd"] = pos["_gap_sold_fee"]
+                            pos["exit_fee_usd"] = pos["_gap_sold_exit_fee"]
+                            pos["poly_pnl_usd"] = pos["_gap_sold_poly_pnl"]
+                            pos["kalshi_pnl_usd"] = pos["_gap_sold_kalshi_pnl"]
+                            pos["pnl_usd"] = round(pos["_gap_sold_poly_pnl"]
+                                                   + pos["_gap_sold_kalshi_pnl"], 2)
+                            pos["status"] = "settled"
+                            pos["settled_at"] = now
+                            pos["gap_monitor_exit"] = True
+                            pos["gap_monitor_risk_score"] = round(risk_score, 4)
+                            pos["gap_monitor_partial"] = pos["_gap_trim_count"] > 1
+                            pos["gap_monitor_trim_count"] = pos["_gap_trim_count"]
+                            pos["resolution_mismatch"] = False
+                            pos["winning_leg"] = "gap-monitor-exit"
+                            exited.append(pos)
             except Exception:
                 pass   # book fetch failed; leave position open, retry next cycle
         try:
@@ -548,8 +581,6 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
                 f.write(json.dumps(record) + "\n")
         except OSError:
             pass
-    if new_records:
-        positions.extend(new_records)
     if exited:
         save_positions(positions)
     return exited

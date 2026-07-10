@@ -239,10 +239,19 @@ def cmd_watch(cfg):
                   f"({checked} pairs checked)")
             with paper.positions_lock:
                 for pos in paper.check_position_gaps(positions, cfg):
-                    print(f"[{_now()}] GAP MONITOR EXIT pnl ${pos['pnl_usd']} | sold "
-                          f"{pos['contracts']:.0f}x both legs at bids (estimated mismatch "
-                          f"probability {pos['gap_monitor_risk_score']*100:.1f}%) "
-                          f"| {pos['kalshi_title'][:45]}")
+                    if pos["status"] == "settled":
+                        trims = pos.get("gap_monitor_trim_count", 1)
+                        trim_note = f" ({trims} trims)" if trims > 1 else ""
+                        print(f"[{_now()}] GAP MONITOR EXIT pnl ${pos['pnl_usd']}{trim_note} "
+                              f"| sold {pos['contracts']:.0f}x both legs at bids total "
+                              f"(estimated mismatch probability "
+                              f"{pos['gap_monitor_risk_score']*100:.1f}%) "
+                              f"| {pos['kalshi_title'][:45]}")
+                    else:
+                        print(f"[{_now()}] GAP MONITOR PARTIAL EXIT | sold some contracts, "
+                              f"{pos['contracts']:.0f}x still open (estimated mismatch "
+                              f"probability {pos['gap_monitor_risk_score']*100:.1f}%) "
+                              f"| {pos['kalshi_title'][:45]}")
                 # DANGER EXIT PAUSED (2026-07-09): backtest showed 3 of 4 verified
                 # exits were false positives (cost more than holding would have) -
                 # paused while the new gap-monitor probability model (above) is
