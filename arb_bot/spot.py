@@ -161,3 +161,50 @@ def joint_mismatch_probability(last_price: float, kalshi_target: float,
     poly_up = sim_poly >= poly_ref
     kalshi_up = sim_kalshi >= kalshi_target
     return float(np.mean(poly_up != kalshi_up))
+
+
+def hold_outcome_probs(last_price: float, kalshi_target: float, poly_ref: float,
+                       sigma_1min_pct: float, seconds_remaining: float,
+                       kalshi_side: str, n_samples: int = 20000) -> dict:
+    """Directional extension of joint_mismatch_probability, for deciding
+    whether to actually exit a specific held position (not just flag risk).
+
+    A 'mismatch' is not always a full loss. The hedge is always built with
+    the poly leg on the opposite side from the kalshi leg (see arb.py's
+    `directions` list: kalshi_side='no' pairs with the poly YES leg and vice
+    versa) so that in a NORMAL, non-mismatched resolution exactly one leg
+    pays $1. When the two venues' references disagree, there are two
+    different mismatch outcomes, not one: the live price can land such that
+    BOTH legs lose (total loss) or BOTH legs win (double payout - a
+    windfall). Treating every mismatch as a guaranteed total loss - as a
+    flat probability threshold implicitly does - overstates the danger by
+    ignoring the windfall side entirely. Which side dominates depends on
+    where the live price actually sits relative to BOTH kalshi_target and
+    poly_ref, which this simulation resolves directly instead of assuming.
+
+    Returns {'p_clean': ..., 'p_both_win': ..., 'p_both_lose': ...} (sums to 1).
+    """
+    import numpy as np
+    minutes_remaining = max(seconds_remaining, 0) / 60
+    sigma_poly = sigma_1min_pct * math.sqrt(max(minutes_remaining, 1 / 60))
+    sigma_kalshi = sigma_poly * math.sqrt(_KALSHI_VAR_RATIO)
+    rho = _ENDPOINT_AVG_CORR
+
+    z1 = np.random.standard_normal(n_samples)
+    z2 = np.random.standard_normal(n_samples)
+    z_poly = z1
+    z_kalshi = rho * z1 + math.sqrt(1 - rho ** 2) * z2
+
+    sim_poly = last_price * (1 + z_poly * sigma_poly / 100)
+    sim_kalshi = last_price * (1 + z_kalshi * sigma_kalshi / 100)
+
+    # poly leg is always the side opposite the kalshi side actually bought
+    poly_leg_is_up = kalshi_side == "no"
+    kalshi_side_wins = (sim_kalshi >= kalshi_target) if kalshi_side == "yes" \
+        else (sim_kalshi < kalshi_target)
+    poly_leg_wins = (sim_poly >= poly_ref) if poly_leg_is_up else (sim_poly < poly_ref)
+
+    both_win = float(np.mean(kalshi_side_wins & poly_leg_wins))
+    both_lose = float(np.mean(~kalshi_side_wins & ~poly_leg_wins))
+    return {"p_clean": 1.0 - both_win - both_lose,
+            "p_both_win": both_win, "p_both_lose": both_lose}

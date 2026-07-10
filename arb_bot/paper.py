@@ -357,11 +357,34 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
     it catches ~40% of real mismatches at a ~14% false-positive rate (~2.8x
     lift over random).
 
-    ACTIVE (gap_monitor_auto_exit, default on): when the estimated mismatch
-    probability crosses gap_monitor_probability_threshold, SELLS both legs
-    immediately at the bids (same walked-depth, real-fee mechanics as the old
-    danger-exit) instead of holding into a possible mismatch. Set
-    gap_monitor_auto_exit to 0 to go back to logging only. Every check is
+    ACTIVE (gap_monitor_auto_exit, default on): gap_monitor_probability_threshold
+    is only a cheap PRE-SCREEN to decide whether it's worth fetching order
+    books at all. The actual exit decision is EV-aware and directional
+    (spot.hold_outcome_probs), not a flat probability cutoff. A flat cutoff
+    alone is not enough here - these are thin-edge trades (max_net_edge caps
+    the locked profit at a few cents), so even a real ~30-50% mismatch
+    probability doesn't justify eating exit slippage that's often many times
+    the edge being protected - AND a "mismatch" isn't always a full loss:
+    the hedge structure means the two references disagreeing sends the
+    position to EITHER a total loss (both legs lose) OR a windfall (both
+    legs pay out), depending on which side of both references the price
+    lands on - not a coin flip, and not always the bad kind. Live data from
+    2026-07-09 showed the flat-threshold version firing on 24 positions for
+    net -$43.53, while the 33 untouched positions that session had ZERO real
+    mismatches and net +$28.62 - a first EV pass using a worst-case-only
+    assumption (mismatch = certain total loss) still fired on 23 of those 24,
+    because at these thin edges a total-loss assumption swamps everything -
+    which is why the win/lose split has to be modeled directly, not assumed.
+
+    EV comparison (once books are fetched):
+      probs    = spot.hold_outcome_probs(...) -> p_clean / p_both_win / p_both_lose
+      ev_hold  = p_clean * expected_profit_usd
+                 + p_both_win * (2*contracts - cost_usd - fee_usd)
+                 + p_both_lose * -(cost_usd + fee_usd)
+      ev_exit  = pnl if sold right now (real proceeds from walking the bids)
+      -> only commit the sale if ev_exit > ev_hold
+
+    Set gap_monitor_auto_exit to 0 to go back to logging only. Every check is
     logged to data/gap_monitor.jsonl regardless, flagged or not, exited or
     not - so the model can keep being validated against real outcomes.
     Returns the list of positions actually exited this cycle."""
@@ -395,8 +418,9 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
         sigma_1min = spot.get_avg_move_pct(asset, vol_refresh, vol_lookback)
         if sigma_1min is None:
             continue
-        risk_score = spot.joint_mismatch_probability(
-            live, target, ref, sigma_1min, tte, mc_samples)
+        probs = spot.hold_outcome_probs(
+            live, target, ref, sigma_1min, tte, pos["kalshi_side"], mc_samples)
+        risk_score = probs["p_both_win"] + probs["p_both_lose"]
         gap_k_pct = abs(live - target) / target * 100
         gap_p_pct = abs(live - ref) / ref * 100
         flagged = risk_score >= prob_threshold
@@ -420,20 +444,31 @@ def check_position_gaps(positions: list, cfg: dict) -> list:
                     exit_fee = math.ceil(k_fee * 100) / 100
                     p_cost = pos.get("poly_cost_usd", round(n * pos["poly_price"], 2))
                     k_cost = pos.get("kalshi_cost_usd", round(n * pos["kalshi_price"], 2))
-                    pos["status"] = "settled"
-                    pos["settled_at"] = now
-                    pos["gap_monitor_exit"] = True
-                    pos["gap_monitor_risk_score"] = round(risk_score, 4)
-                    pos["exit_fee_usd"] = exit_fee
-                    pos["resolution_mismatch"] = False
-                    pos["winning_leg"] = "gap-monitor-exit"
-                    pos["poly_pnl_usd"] = round(p_proceeds - p_cost, 2)
-                    pos["kalshi_pnl_usd"] = round(k_proceeds - k_cost - pos["fee_usd"]
-                                                  - exit_fee, 2)
-                    pos["pnl_usd"] = round(k_proceeds + p_proceeds - pos["cost_usd"]
-                                           - pos["fee_usd"] - exit_fee, 2)
-                    record["exited"] = True
-                    exited.append(pos)
+                    ev_exit = k_proceeds + p_proceeds - pos["cost_usd"] - pos["fee_usd"] - exit_fee
+                    pnl_hold_clean = pos.get("expected_profit_usd", 0.0)
+                    pnl_hold_both_win = 2 * n - pos["cost_usd"] - pos["fee_usd"]
+                    pnl_hold_both_lose = -(pos["cost_usd"] + pos["fee_usd"])
+                    ev_hold = (probs["p_clean"] * pnl_hold_clean
+                               + probs["p_both_win"] * pnl_hold_both_win
+                               + probs["p_both_lose"] * pnl_hold_both_lose)
+                    record["ev_exit"] = round(ev_exit, 4)
+                    record["ev_hold"] = round(ev_hold, 4)
+                    record["p_both_win"] = round(probs["p_both_win"], 4)
+                    record["p_both_lose"] = round(probs["p_both_lose"], 4)
+                    if ev_exit > ev_hold:
+                        pos["status"] = "settled"
+                        pos["settled_at"] = now
+                        pos["gap_monitor_exit"] = True
+                        pos["gap_monitor_risk_score"] = round(risk_score, 4)
+                        pos["exit_fee_usd"] = exit_fee
+                        pos["resolution_mismatch"] = False
+                        pos["winning_leg"] = "gap-monitor-exit"
+                        pos["poly_pnl_usd"] = round(p_proceeds - p_cost, 2)
+                        pos["kalshi_pnl_usd"] = round(k_proceeds - k_cost - pos["fee_usd"]
+                                                      - exit_fee, 2)
+                        pos["pnl_usd"] = round(ev_exit, 2)
+                        record["exited"] = True
+                        exited.append(pos)
             except Exception:
                 pass   # book fetch failed; leave position open, retry next cycle
         try:
