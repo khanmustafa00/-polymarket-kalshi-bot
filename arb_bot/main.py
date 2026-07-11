@@ -191,6 +191,18 @@ def _refresh_into(cfg, out: dict):
         out["error"] = e
 
 
+def _all_expired(matches) -> bool:
+    """True if every currently-tracked pair is past expiry (or the list is
+    empty) - i.e. scanning them can only ever produce instant no-op early
+    returns (see arb.py's tte <= 0 checks) until a fresh match list arrives.
+    Used to trigger an immediate refresh right after a 15-min window rolls
+    over, instead of waiting out the rest of refresh_match_seconds blind."""
+    if not matches:
+        return True
+    now = time.time()
+    return all(min(m["kalshi"]["expiry"], m["poly"]["expiry"]) - now <= 0 for m in matches)
+
+
 def cmd_watch(cfg):
     # single-instance guard: refuse to run if another bot's heartbeat is fresh
     # (two bots writing positions.json bypass each other's position caps)
@@ -227,8 +239,12 @@ def cmd_watch(cfg):
                 else:
                     print(f"[{_now()}] refresh error: {refresh_box.get('error')!r} - continuing")
                 refresh_thread = None
-            # kick off a new refresh in the background; scanning continues meanwhile
-            if refresh_thread is None and time.time() - last_refresh > cfg["refresh_match_seconds"]:
+            # kick off a new refresh in the background; scanning continues meanwhile.
+            # Also fire immediately (ignoring the timer) once every tracked pair
+            # has expired - otherwise a 15-min window rollover leaves the bot
+            # scanning a dead list for up to refresh_match_seconds doing nothing.
+            if refresh_thread is None and (time.time() - last_refresh > cfg["refresh_match_seconds"]
+                                           or _all_expired(matches)):
                 last_refresh = time.time()
                 refresh_box = {}
                 refresh_thread = threading.Thread(target=_refresh_into,
