@@ -134,7 +134,7 @@ DEFAULTS = {
     "poll_seconds": 3,              # cross-venue book scan interval (books fetched
                                     # in parallel) - kept slower/more careful since
                                     # cross-venue trades carry real mismatch risk
-    "bundle_poll_seconds": 1,       # SEPARATE, faster scan interval for bundles
+    "bundle_poll_seconds": 2,       # SEPARATE, faster scan interval for bundles
                                     # only - runs in its own thread, independent of
                                     # the cross-venue loop above. Bundles are
                                     # mismatch-proof (one venue, one referee), so
